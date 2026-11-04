@@ -1,0 +1,114 @@
+name: Update contribution graph
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 2 * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/contribution-graph.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: profile-contribution-graph
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate and save contribution SVG
+        uses: actions/github-script@v9
+        with:
+          retries: 3
+          script: |
+            const {owner, repo} = context.repo;
+            const branch = context.payload.repository?.default_branch || 'main';
+            const end = new Date();
+            const start = new Date(end);
+            start.setUTCHours(0, 0, 0, 0);
+            start.setUTCDate(start.getUTCDate() - 30);
+            const result = await github.graphql(`
+              query($login: String!, $from: DateTime!, $to: DateTime!) {
+                user(login: $login) {
+                  contributionsCollection(from: $from, to: $to) {
+                    contributionCalendar {
+                      weeks { contributionDays { date contributionCount } }
+                    }
+                  }
+                }
+              }
+            `, {login: owner, from: start.toISOString(), to: end.toISOString()});
+            if (!result.user) throw new Error('GitHub profile was not found.');
+            const weeks = result.user.contributionsCollection.contributionCalendar.weeks;
+            const calendar = new Map(weeks.flatMap(w => w.contributionDays)
+              .map(day => [day.date, day.contributionCount]));
+            const days = Array.from({length: 31}, (_, i) => {
+              const date = new Date(start);
+              date.setUTCDate(date.getUTCDate() + i);
+              const key = date.toISOString().slice(0, 10);
+              const count = calendar.get(key);
+              if (!Number.isSafeInteger(count) || count < 0) {
+                throw new Error('Incomplete or invalid contribution data; keeping the previous SVG.');
+              }
+              return {date: key, count};
+            });
+            const escape = value => String(value).replace(/[&<>"']/g,
+              c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&apos;'}[c]));
+            const left = 55, right = 975, top = 72, bottom = 248;
+            const maximum = Math.max(4, Math.ceil(Math.max(...days.map(d => d.count)) / 4) * 4);
+            const x = i => left + (right - left) * i / 30;
+            const y = count => bottom - (bottom - top) * count / maximum;
+            const format = value => value.toFixed(2);
+            const points = days.map((d, i) => `${format(x(i))},${format(y(d.count))}`).join(' ');
+            const total = days.reduce((sum, d) => sum + d.count, 0);
+            const grid = Array.from({length: 5}, (_, i) => {
+              const count = maximum * i / 4;
+              const py = format(y(count));
+              return `<line x1="${left}" y1="${py}" x2="${right}" y2="${py}" stroke="#2f3e46" opacity="0.12"/>` +
+                `<text x="43" y="${format(y(count) + 4)}" text-anchor="end" font-size="12">${count}</text>`;
+            }).join('');
+            const dates = days.map((d, i) => i % 5 === 0
+              ? `<text x="${format(x(i))}" y="271" text-anchor="middle" font-size="12">${d.date.slice(5)}</text>`
+              : '').join('');
+            const dots = days.map((d, i) =>
+              `<circle cx="${format(x(i))}" cy="${format(y(d.count))}" r="3.2" fill="#1c2541"><title>${d.date}: ${d.count} contributions</title></circle>`
+            ).join('');
+            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="300" viewBox="0 0 1000 300" role="img" aria-labelledby="title description">
+            <title id="title">${escape(owner)} contribution activity</title>
+            <desc id="description">${total} public contributions over 31 days, from ${days[0].date} to ${days[30].date}.</desc>
+            <rect width="1000" height="300" fill="#ffd1dc"/>
+            <g font-family="system-ui,Segoe UI,sans-serif" fill="#2f3e46">
+            <text x="55" y="31" font-size="22" font-weight="600" fill="#1c2541">${escape(owner)}'s contribution activity</text>
+            <text x="55" y="53" font-size="13">Public contributions · ${days[0].date} to ${days[30].date}</text>
+            ${grid}
+            <polygon points="${left},${bottom} ${points} ${right},${bottom}" fill="#1c2541" opacity="0.12"/>
+            <polyline points="${points}" fill="none" stroke="#1c2541" stroke-width="2.5" stroke-linejoin="round"/>
+            ${dots}${dates}
+            <text x="975" y="293" text-anchor="end" font-size="11">${total} public contributions · last 31 days</text>
+            </g></svg>\n`;
+            const path = 'assets/contribution-graph.svg';
+            let existing;
+            try {
+              existing = (await github.rest.repos.getContent({owner, repo, path, ref: branch})).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (existing && (existing.type !== 'file' || existing.encoding !== 'base64')) {
+              throw new Error('The graph path is not a regular SVG file.');
+            }
+            if (existing && Buffer.from(existing.content, 'base64').toString('utf8') === svg) {
+              core.info('The graph is already current.');
+              return;
+            }
+            await github.rest.repos.createOrUpdateFileContents({
+              owner, repo, path, branch,
+              message: 'chore(profile): update contribution graph',
+              content: Buffer.from(svg, 'utf8').toString('base64'),
+              ...(existing ? {sha: existing.sha} : {})
+            });
+            core.info('Saved assets/contribution-graph.svg.');
